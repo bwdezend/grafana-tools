@@ -10,17 +10,16 @@ import codecs
 import re
 import shutil
 import sys
-import tarfile
 import tempfile
 import urllib
 import urllib2
-
+import git
 
 def grafana_dashboard_backups(elastic_host, elastic_port, dest_dir, es_index_name, debug):
-  '''Saves all Grafana dashboards stored in Elasticsearch in a tarball
+  '''Saves all changes to Grafana dashboards stored in Elasticsearch in a git repo
   
-     Uses Elasticsearch API to get all saved dashboards into a tarball, the 
-     tarball contains one file per dashboard and is available in destination dir
+     Uses Elasticsearch API to get all saved dashboards into a git repo, the 
+     repo contains one file per dashboard and is available in destination dir
      which is parameterized (defaults to /var/opt/grafana-dashboards-backups).'''
   
   #Set Logging to syslog
@@ -90,12 +89,14 @@ def grafana_dashboard_backups(elastic_host, elastic_port, dest_dir, es_index_nam
 
   scroll_id = scan()['_scroll_id']
 
-  # Create a tarball with all the dashboards and move to target dir
-  
-  tarball_name = '%s.%s.tar.gz' % (es_index_name, formatted_time)
-  tarball      = os.path.join(work_tmp_dir, tarball_name)
-  tar          = tarfile.open(tarball, 'w:gz')
+  # Init a git repo object, pointing at a repo with all the dashboards
 
+  gitrepo_name = '%s' % (es_index_name)
+  gitrepo      = os.path.join(dest_dir)
+  repo         = git.Repo(gitrepo)
+  
+  commit_message = ''
+  
   if not scroll_id:
     raise Exception('Failed to get scroll id')
 
@@ -117,27 +118,51 @@ def grafana_dashboard_backups(elastic_host, elastic_port, dest_dir, es_index_nam
         dashboard_file_path  = os.path.join(work_tmp_dir, dashboard_file_name)
 
         json_dump(dashboard_definition, dashboard_file_path)
-        tar.add(dashboard_file_path, '%s/%s' % (es_index_name, dashboard_file_name))
 
         metadata_file_name = '%s.metadata.json' % dashboard_base_name
         metadata_file_path = os.path.join(work_tmp_dir, metadata_file_name)
         source['dashboard'] = 'stored in alternate file %s' % dashboard_file_name
         json_dump(hit, metadata_file_path)
-        tar.add(metadata_file_path, '%s/%s' % (es_index_name, metadata_file_name))
+        
+        gitrepo_file_path  = os.path.join(gitrepo, dashboard_file_name)
+        shutil.copyfile(dashboard_file_path, gitrepo_file_path)
+        repo.index.add([dashboard_file_name])
+        
+        gitrepo_file_meta_path  = os.path.join(gitrepo, metadata_file_name)
+        shutil.copyfile(metadata_file_path, gitrepo_file_meta_path)
+        repo.index.add([metadata_file_name])
 
-        logger.info('Added %s to the dashboards backup tarball' % did)
+        logger.info('Added %s to the git repo' % did)
 
     except Exception as e:
       logging.critical(e)
       sys.exit(1)
   
   try:
-    tar.close()
-    tarball_dest = os.path.join(dest_dir, tarball_name)
-    os.rename(tarball,tarball_dest)
-    logger.info('New grafana dashboards backup at %s' % tarball_dest)
+    if repo.index.diff('HEAD'):
+          
+      commit_message = '%s\n' % formatted_time
+
+      for diff in repo.index.diff('HEAD').iter_change_type('M'):
+        logger.info(' M %s' % str(diff).splitlines()[0] )
+        commit_message += ' %s was modified\n' % str(diff).splitlines()[0]
+      for diff in repo.index.diff('HEAD').iter_change_type('D'):
+        logger.info('%s was added' % diff)
+        commit_message += ' %s was added\n' % str(diff).splitlines()[0]
+      for diff in repo.index.diff('HEAD').iter_change_type('A'):
+        logger.info('%s was deleted' % diff)
+        commit_message += ' %s was deleted\n' % str(diff).splitlines()[0]
+      for diff in repo.index.diff('HEAD').iter_change_type('R'):
+        logger.info('%s was renamed' % diff)
+        commit_message += ' %s was renamed\n' % str(diff).splitlines()[0]
+      logger.info('Making a new git commit (%s)' % formatted_time)
+      print('commit message: %s' % commit_message)
+      repo.index.commit(commit_message)
+    else:
+      logger.info('No changes detected. No commit made')
+
   except Exception as e:
-    logging.critical('Failed to move tarball to %s' % dest_dir)
+    logging.critical('Failed to commit to git repo')
     logging.critical(e)
     sys.exit(1)
   
@@ -171,7 +196,7 @@ def main():
   parser.add_option('-t', '--dest-dir',
     default = '/var/opt/grafana-dashboards-backups',
     dest    = 'dest_dir',
-    help    = 'The destination directory where dashboards will be saved',
+    help    = 'The directory where dashboards git repo is located',
     metavar = 'DEST_DIR')
 
   parser.add_option('-i', '--index-name',
